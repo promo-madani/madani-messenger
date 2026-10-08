@@ -1,0 +1,9 @@
+{
+  "name": "Madani Messenger",
+  "short_name": "Messenger",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0A3F2E",
+  "theme_color": "#0A3F2E",
+  "icons": [{ "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml" }]
+}

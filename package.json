@@ -1,0 +1,15 @@
+{
+  "name": "madani-messenger",
+  "private": true,
+  "description": "Madani Channel staff messenger on Firebase",
+  "scripts": {
+    "emulators": "firebase emulators:start --project demo-madani",
+    "test:rules": "node tests/rules.test.mjs",
+    "deploy": "firebase deploy"
+  },
+  "devDependencies": {
+    "firebase-tools": "15.33.0",
+    "@firebase/rules-unit-testing": "5.0.0",
+    "firebase": "12.19.0"
+  }
+}

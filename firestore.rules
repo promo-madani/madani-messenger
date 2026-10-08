@@ -1,0 +1,177 @@
+rules_version = '2';
+
+// Madani Messenger — who may read and write what.
+//
+// People sign in with username + PIN (Firebase Auth email/password behind the scenes).
+// Only someone who has a profile in /users is a member; a profile can only be created
+// with the team join code, which lives in /config/join and is never readable by apps.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() { return request.auth != null; }
+    function me() { return request.auth.uid; }
+    function isMember() { return signedIn() && exists(/databases/$(database)/documents/users/$(me())); }
+    function isAdmin() {
+      return signedIn() && me() in get(/databases/$(database)/documents/config/admins).data.uids;
+    }
+    function changed() { return request.resource.data.diff(resource.data).affectedKeys(); }
+    function str(v, max) { return v is string && v.size() <= max; }
+    function optStr(data, key, max) { return !(key in data) || str(data[key], max); }
+
+    // ---------- Settings (only through the Firebase console / admin tools) ----------
+    match /config/{doc} {
+      allow read, write: if false;
+    }
+
+    // ---------- People ----------
+    match /users/{uid} {
+      allow read: if isMember();
+      // Join: the profile and the join-code proof are written together in one batch.
+      allow create: if signedIn() && me() == uid
+        && request.resource.data.keys().hasOnly(['username', 'displayName', 'title', 'color', 'createdAt', 'lastSeen'])
+        && request.resource.data.username is string
+        && request.resource.data.username.matches('^[a-z0-9][a-z0-9._-]{2,23}$')
+        && request.auth.token.email == request.resource.data.username + '@users.madani.invalid'
+        && str(request.resource.data.displayName, 60) && request.resource.data.displayName.size() > 0
+        && optStr(request.resource.data, 'title', 60)
+        && optStr(request.resource.data, 'color', 9)
+        && request.resource.data.createdAt == request.time
+        && getAfter(/databases/$(database)/documents/users/$(uid)/private/join).data.code
+           == get(/databases/$(database)/documents/config/join).data.code;
+      allow update: if signedIn() && me() == uid
+        && changed().hasOnly(['displayName', 'title', 'color', 'lastSeen'])
+        && str(request.resource.data.displayName, 60) && request.resource.data.displayName.size() > 0
+        && optStr(request.resource.data, 'title', 60);
+      allow delete: if false;
+
+      match /private/join {
+        allow read: if signedIn() && me() == uid;
+        allow create: if signedIn() && me() == uid
+          && request.resource.data.keys().hasOnly(['code'])
+          && request.resource.data.code == get(/databases/$(database)/documents/config/join).data.code;
+        allow update, delete: if false;
+      }
+
+      // My devices (phones and linked computers). Deleting one signs that device out.
+      match /devices/{deviceId} {
+        allow read, delete: if signedIn() && me() == uid;
+        allow create, update: if signedIn() && me() == uid
+          && request.resource.data.keys().hasOnly(['name', 'platform', 'via', 'by', 'createdAt', 'lastActive', 'fcm'])
+          && str(request.resource.data.name, 80);
+      }
+
+      // My own read positions for unread badges: { convId: timestamp }.
+      match /state/{doc} {
+        allow read, write: if signedIn() && me() == uid;
+      }
+    }
+
+    // ---------- Conversations: direct messages, groups and channels ----------
+    match /convs/{cid} {
+      function conv() { return get(/databases/$(database)/documents/convs/$(cid)).data; }
+      function canSee(c) { return isMember() && (c.type == 'channel' || me() in c.members); }
+      function canPost(c) { return canSee(c) && !(c.type == 'channel' && c.get('readOnly', false) && !isAdmin()); }
+
+      allow read: if isMember() && (resource == null || resource.data.type == 'channel' || me() in resource.data.members);
+
+      allow create: if isMember()
+        && request.resource.data.createdBy == me()
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.members is list && me() in request.resource.data.members
+        && request.resource.data.members.size() <= 500
+        && (
+          // Direct message: id is dm_<uidA>_<uidB>, sorted, exactly those two people.
+          (request.resource.data.type == 'dm'
+            && request.resource.data.members.size() == 2
+            && (cid == 'dm_' + request.resource.data.members[0] + '_' + request.resource.data.members[1])
+            && request.resource.data.members[0] < request.resource.data.members[1])
+          || (request.resource.data.type == 'group' && str(request.resource.data.name, 60) && request.resource.data.name.size() > 0)
+          || (request.resource.data.type == 'channel'
+            && request.resource.data.name.matches('^[a-z0-9][a-z0-9-]{1,39}$')
+            && (!request.resource.data.get('readOnly', false) || isAdmin()))
+        );
+
+      allow update: if isMember() && (
+        // Anyone who can post may move the "last message" preview (written with each message).
+        (canPost(resource.data) && changed().hasOnly(['last', 'updatedAt']) && request.resource.data.updatedAt == request.time)
+        // Join or leave a channel: only your own entry in the member list changes.
+        || (resource.data.type == 'channel' && changed().hasOnly(['members'])
+            && request.resource.data.members.toSet().difference(resource.data.members.toSet()).union(
+               resource.data.members.toSet().difference(request.resource.data.members.toSet())).hasOnly([me()]))
+        // Group creator or admins edit the name, topic, members or pinned note.
+        || ((resource.data.createdBy == me() || isAdmin()) && resource.data.type != 'dm'
+            && changed().hasOnly(['name', 'topic', 'members', 'pinned', 'readOnly'])
+            && (!('readOnly' in changed()) || isAdmin()))
+      );
+      allow delete: if isAdmin() && resource.data.type != 'dm';
+
+      match /msgs/{mid} {
+        function validNew(d) {
+          return d.from == me() && d.ts == request.time
+            && d.keys().hasOnly(['from', 'ts', 'kind', 'text', 'file', 'reply', 'mentions', 'threadCount'])
+            && d.kind in ['text', 'image', 'file', 'voice']
+            && optStr(d, 'text', 8000)
+            && (!('mentions' in d) || (d.mentions is list && d.mentions.size() <= 50))
+            && (!('threadCount' in d) || d.threadCount == 0);
+        }
+        allow read: if canSee(conv());
+        allow create: if canPost(conv()) && validNew(request.resource.data);
+        allow update: if canSee(conv()) && (
+          // React: only your own entry in the reactions map.
+          (changed().hasOnly(['reactions'])
+            && request.resource.data.reactions.diff(resource.data.get('reactions', {})).affectedKeys().hasOnly([me()]))
+          // Thread bookkeeping, written together with a reply.
+          || (changed().hasOnly(['threadCount', 'threadLast', 'threadUsers'])
+            && request.resource.data.threadCount == resource.data.get('threadCount', 0) + 1
+            && request.resource.data.threadLast == request.time)
+          // Delete for everyone: the sender (or an admin) blanks the message.
+          || ((resource.data.from == me() || isAdmin())
+            && changed().hasOnly(['deleted', 'text', 'file'])
+            && request.resource.data.deleted == true && request.resource.data.text == '' && request.resource.data.file == null)
+          // Edit your own text.
+          || (resource.data.from == me() && changed().hasOnly(['text', 'edited']) && str(request.resource.data.text, 8000)
+            && request.resource.data.edited == request.time)
+        );
+        allow delete: if false;
+
+        match /replies/{rid} {
+          allow read: if canSee(conv());
+          allow create: if canSee(conv()) && validNew(request.resource.data);
+          allow update: if canSee(conv()) && (
+            (changed().hasOnly(['reactions'])
+              && request.resource.data.reactions.diff(resource.data.get('reactions', {})).affectedKeys().hasOnly([me()]))
+            || ((resource.data.from == me() || isAdmin())
+              && changed().hasOnly(['deleted', 'text', 'file'])
+              && request.resource.data.deleted == true && request.resource.data.text == '' && request.resource.data.file == null)
+          );
+        }
+      }
+
+      // Read receipts ("Seen" ticks) and typing indicators.
+      match /reads/{uid} {
+        allow read: if canSee(conv());
+        allow write: if me() == uid && canSee(conv()) && request.resource.data.keys().hasOnly(['ts']) && request.resource.data.ts == request.time;
+      }
+      match /typing/{uid} {
+        allow read: if canSee(conv());
+        allow write: if me() == uid && canSee(conv()) && request.resource.data.keys().hasOnly(['ts']) && request.resource.data.ts == request.time;
+      }
+    }
+
+    // ---------- Link a computer with a QR code ----------
+    // The computer signs in anonymously and creates the link. A signed-in phone looks it up
+    // while it is pending; approval happens in the approveLink function, which writes a
+    // sign-in token that only the computer that created the link can read.
+    match /links/{id} {
+      allow create: if signedIn()
+        && request.resource.data.keys().hasOnly(['pc', 'codeHash', 'device', 'createdAt', 'status'])
+        && request.resource.data.pc == me()
+        && request.resource.data.status == 'pending'
+        && request.resource.data.createdAt == request.time
+        && str(request.resource.data.device, 80);
+      allow get: if signedIn() && (resource.data.pc == me() || (isMember() && resource.data.status == 'pending'));
+      allow list, update: if false;
+      allow delete: if signedIn() && resource.data.pc == me();
+    }
+  }
+}
